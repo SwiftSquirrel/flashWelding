@@ -3,7 +3,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import get_labeled_file_paths, shuffle_data
+from utils import get_labeled_file_paths, shuffle_data, process_file_for_prediction
 import numpy as np
 import pandas as pd
 import joblib
@@ -15,6 +15,7 @@ import random
 import os
 import torch.autograd as autograd
 import math
+from collections import Counter
 
 
 # 创建日志目录
@@ -108,7 +109,7 @@ def global_standardize_and_convert_to_tensor(dataframes, scaler=None):
         standardized_combined_data = scaler.fit_transform(combined_data)
 
         # 保存 scaler 到本地文件
-        scaler_file = "scaler.pkl"
+        scaler_file = "scaler_seq.pkl"
         joblib.dump(scaler, scaler_file)
 
         print(f"Scaler 已保存到 {scaler_file}")
@@ -130,58 +131,74 @@ def global_standardize_and_convert_to_tensor(dataframes, scaler=None):
 
 
 
-class FlashWeldingCNN_Simple(nn.Module):
-    """
-    简化版闪光焊CNN模型（适用于小样本，约500条）
-    - 更小的通道数
-    - 更简单的分类头
-    - 减少过拟合风险
-    """
+class DualInputFlashWeldingModel(nn.Module):
+    def __init__(self, input_channels=4, seq_len=None, static_dim=5, num_classes=2, feature_dim=64):
+        super(DualInputFlashWeldingModel, self).__init__()
 
-    def __init__(self, input_channels=4, num_classes=2):
-        super(FlashWeldingCNN_Simple, self).__init__()
-
-        # 轻量化特征提取器（减少通道数）
-        self.conv_layers = nn.Sequential(
-            # 第一层：捕捉短期模式
-            nn.Conv1d(input_channels, 32, kernel_size=5,
-                      padding=2),  # 64 -> 32
+        # === 分支1: CNN 处理时间序列 x1 (B, C, T) ===
+        self.cnn_branch = nn.Sequential(
+            nn.Conv1d(input_channels, 32, kernel_size=5, padding=2),
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.MaxPool1d(2),
 
-            # 第二层：捕捉中期模式
-            nn.Conv1d(32, 64, kernel_size=5, padding=2),  # 128 -> 64
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.MaxPool1d(2),
 
-            # 第三层：捕捉长期模式（可选保留）
-            nn.Conv1d(64, 64, kernel_size=3, padding=1),  # 256 -> 64
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm1d(64),
             nn.ReLU(),
 
-            nn.AdaptiveAvgPool1d(1),      # 全局平均池化，适应变长序列
-            nn.Flatten(),                 # 展平为 (batch_size, 64)
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten()  # -> (B, 64)
         )
 
-        # 极简分类头：全局池化 + Dropout + 单层全连接
-        self.classifier = nn.Sequential(
-            nn.Linear(64, num_classes)    # 直接输出类别 logits
+        # === 分支2: MLP 处理静态特征 x2 (B, k) ===
+        self.mlp_branch = nn.Sequential(
+            nn.Linear(static_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, 64),
+            nn.ReLU()
         )
 
-    def forward(self, x):
-        logits, features = self.forward_with_features(x)
-        return logits
+        # === 融合后总特征维度 ===
+        self.fusion_dim = 64 + 64  # cnn_feat(64) + mlp_feat(64)
 
-    def forward_with_features(self, x):
-        features = self.conv_layers(x)  # [B, 64]
-        logits = self.classifier(features)
-        return logits, features
+        # === 分类头 ===
+        self.classifier = nn.Linear(self.fusion_dim, num_classes)
 
-    def get_features(self, x):
-        return self.conv_layers(x)  # 只提取特征 [B, 64]
+        # === 特征融合方式可选：拼接、相加、注意力等 ===
+        self._initialize_weights()
 
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x_seq, x_static):
+        """
+        Args:
+            x_seq: (B, C, T) 时序信号
+            x_static: (B, k)   静态特征
+        Returns:
+            logits: (B, num_classes)
+            fused_features: (B, fusion_dim) 用于 domain discriminator
+        """
+        feat_cnn = self.cnn_branch(x_seq)           # (B, 64)
+        feat_mlp = self.mlp_branch(x_static)        # (B, 64)
+        fused_features = torch.cat([feat_cnn, feat_mlp], dim=1)  # (B, 128)
+
+        logits = self.classifier(fused_features)
+        return logits, fused_features
+
+    def get_features(self, x_seq, x_static):
+        """ 提取融合特征，用于对抗训练 """
+        return self.forward(x_seq, x_static)[1]  # 返回 fused_features
 
 
 # 数据准备示例
@@ -237,23 +254,19 @@ class FocalLoss(nn.Module):
 
 
 
-
-def train_model_adversarial(model, train_loader, test_loader,
-                            num_epochs=10, learning_rate=0.001,
-                            lambda_max=0.5, writer=None, use_linear_schedule=False):
-    """
-    使用对抗训练进行领域自适应
-    """
-
+def train_model_adversarial_dual(
+    model, train_loader, test_loader,
+    num_epochs=10, learning_rate=0.001,
+    lambda_max=0.5, writer=None, use_linear_schedule=False
+):
     global_step = 0
-    total_steps = num_epochs * len(train_loader)  # 总优化步数
+    total_steps = num_epochs * len(train_loader)
 
-    # 定义损失函数和优化器
-    criterion_cls = FocalLoss(alpha=2, gamma=2)  # 分类损失
-    domain_discriminator = DomainDiscriminator(feature_dim=64).to(device)
+    criterion_cls = FocalLoss(alpha=2, gamma=2)
+    domain_discriminator = DomainDiscriminator(
+        feature_dim=model.fusion_dim).to(device)
     grl = GradientReverseLayer()
 
-    # 优化器：联合优化 model 和 domain_discriminator
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(domain_discriminator.parameters()),
         lr=learning_rate
@@ -271,87 +284,75 @@ def train_model_adversarial(model, train_loader, test_loader,
         all_train_labels = []
         domain_preds, domain_labels = [], []
 
-        for batch_x_src, batch_y_src in train_loader:
-
-            # ✅ 动态计算 lambda_adv
-            p = global_step / total_steps  # 当前训练进度 [0, 1]
+        for batch_x_seq_src, batch_x_static_src, batch_y_src in train_loader:
+            p = global_step / total_steps
             if use_linear_schedule:
-                lambda_adv = lambda_max * p  # 线性增长
+                lambda_adv = lambda_max * p
             else:
-                # 可选：更平滑的调度（来自 DANN 论文）
                 lambda_adv = lambda_max * (2 / (1 + math.exp(-10 * p)) - 1)
 
-
             try:
-                batch_x_tgt, _ = next(test_iter)
+                batch_x_seq_tgt, batch_x_static_tgt, _ = next(test_iter)
             except StopIteration:
                 test_iter = iter(test_loader)
-                batch_x_tgt, _ = next(test_iter)
+                batch_x_seq_tgt, batch_x_static_tgt, _ = next(test_iter)
 
             # 移动到设备
-            batch_x_src = batch_x_src.to(device)
+            batch_x_seq_src = batch_x_seq_src.to(device)
+            batch_x_static_src = batch_x_static_src.to(device)
             batch_y_src = batch_y_src.to(device)
-            batch_x_tgt = batch_x_tgt.to(device)
 
-            # 拼接 src 和 tgt
-            x_concat = torch.cat([batch_x_src, batch_x_tgt], 0)
+            batch_x_seq_tgt = batch_x_seq_tgt.to(device)
+            batch_x_static_tgt = batch_x_static_tgt.to(device)
+
+            # 拼接源域和目标域输入
+            x_seq_concat = torch.cat([batch_x_seq_src, batch_x_seq_tgt], 0)
+            x_static_concat = torch.cat(
+                [batch_x_static_src, batch_x_static_tgt], 0)
             domain_labels_true = torch.cat([
-                torch.zeros(batch_x_src.size(0)),  # src -> 0
-                torch.ones(batch_x_tgt.size(0))    # tgt -> 1
+                torch.zeros(batch_x_seq_src.size(0)),
+                torch.ones(batch_x_seq_tgt.size(0))
             ], 0).to(device)
 
-            # 提取特征
-            features = model.get_features(x_concat)  # [B_src + B_tgt, 64]
+            # 提取融合特征
+            features = model.get_features(x_seq_concat, x_static_concat)
 
-            # === 领域判别损失（判别器要能分清 src/tgt）===
-            domain_logits = domain_discriminator(
-                features.detach())  # detach：不更新 feature extractor
+            # === 域判别损失（冻结主干）===
+            domain_logits = domain_discriminator(features.detach())
             loss_domain = F.binary_cross_entropy_with_logits(
                 domain_logits.squeeze(), domain_labels_true
             )
             total_domain_loss += loss_domain.item()
 
             # === 分类损失（仅源域）===
-            logits_src, _ = model.forward_with_features(batch_x_src)
+            logits_src, _ = model(batch_x_seq_src, batch_x_static_src)
             loss_cls = criterion_cls(logits_src, batch_y_src)
             total_cls_loss += loss_cls.item()
 
-            # === 对抗损失（特征提取器要骗过判别器）===
-            # 使用 GRL：让特征提取器“最小化”域判别损失，但梯度反向
+            # === 对抗损失（梯度反转）===
             domain_logits_adv = domain_discriminator(grl(features))
             loss_adv = F.binary_cross_entropy_with_logits(
-                domain_logits_adv.squeeze(),
-                1 - domain_labels_true  # 对抗目标：让判别器输出相反
-                # 或直接用 domain_labels_true，因为 grl 已反转梯度
+                domain_logits_adv.squeeze(), domain_labels_true
             )
-            # 更简单写法：直接用 domain_labels_true，GRL 负梯度自动对抗
-            # loss_adv = F.binary_cross_entropy_with_logits(domain_logits_adv.squeeze(), domain_labels_true)
 
-
-            # 总损失
             loss = loss_cls + lambda_adv * loss_adv
 
-            # 反向传播
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-
-            # 记录
+            # 记录指标
             _, predicted = torch.max(logits_src, 1)
             all_train_preds.extend(predicted.cpu().numpy())
             all_train_labels.extend(batch_y_src.cpu().numpy())
 
-            # 记录 domain 判别结果（用于监控）
             dom_pred = (torch.sigmoid(domain_logits) > 0.5).float()
             domain_preds.extend(dom_pred.cpu().numpy())
             domain_labels.extend(domain_labels_true.cpu().numpy())
 
             global_step += 1
 
-
-
-        # 计算指标
+        # 计算平均损失与准确率
         avg_cls_loss = total_cls_loss / len(train_loader)
         avg_domain_loss = total_domain_loss / len(train_loader)
         train_acc = accuracy_score(all_train_labels, all_train_preds)
@@ -363,59 +364,53 @@ def train_model_adversarial(model, train_loader, test_loader,
               f"Train Acc: {train_acc:.4f}, "
               f"Domain Acc: {domain_acc:.4f}")
 
-        # 测试模型
-        test_acc = test_model(model, test_loader)
+        test_acc = test_model_dual(model, test_loader)  # 见下方定义
         print(f"Test Accuracy: {test_acc:.4f}")
 
-        # ✅ 记录当前 lambda_adv
-        current_lambda = lambda_max * (global_step / total_steps)
-        if not use_linear_schedule:
-            current_lambda = lambda_max * \
-                (2 / (1 + math.exp(-10 * (global_step / total_steps))) - 1)
-
-        # 记录到 TensorBoard
+        # 写入 TensorBoard
+        current_lambda = lambda_max * \
+            (2 / (1 + math.exp(-10 * (global_step / total_steps))) - 1)
         writer.add_scalar('Loss/Classification', avg_cls_loss, epoch)
         writer.add_scalar('Loss/Domain', avg_domain_loss, epoch)
-        writer.add_scalar('Loss/Total', avg_cls_loss +
-                          lambda_adv * avg_domain_loss, epoch)
         writer.add_scalar('Accuracy/Train', train_acc, epoch)
         writer.add_scalar('Accuracy/Test', test_acc, epoch)
         writer.add_scalar('Accuracy/Domain', domain_acc, epoch)
-        writer.add_scalar(
-            'Learning Rate', optimizer.param_groups[0]['lr'], epoch)
-        writer.add_scalar(
-            'current_lambda', current_lambda, epoch)
+        writer.add_scalar('current_lambda', current_lambda, epoch)
 
     # 测试模型
-    test_model(model, test_loader, record_report=True, writer=writer)
+    test_model_dual(model, test_loader, record_report=True, writer=writer)
 
 
 
-def test_model(model, test_loader, record_report=False, writer=None):
+def test_model_dual(model, test_loader, record_report=False, writer=None):
     """
-    在测试集上评估模型准确率。
-    
+    在测试集上评估双输入模型的准确率，并可选记录分类报告。
+
     Args:
-        model: 训练好的模型（FlashWeldingCNN_Simple）
-        test_loader: 测试数据加载器（目标域）
+        model: 训练好的双输入模型（DualInputFlashWeldingModel）
+        test_loader: 测试数据加载器，返回 (x_seq, x_static, labels)
+        record_report (bool): 是否生成并记录 classification_report
+        writer: TensorBoard SummaryWriter（如果 record_report=True，则需要）
+        epoch (int): 当前 epoch，用于 TensorBoard 记录
 
     Returns:
-        accuracy: 测试准确率（float）
+        accuracy (float): 测试准确率
     """
     model.eval()  # 设置为评估模式
     all_preds = []
     all_labels = []
 
     with torch.no_grad():  # 关闭梯度计算
-        for batch_x, batch_y in test_loader:
-            batch_x = batch_x.to(device)
+        for batch_x_seq, batch_x_static, batch_y in test_loader:
+            batch_x_seq = batch_x_seq.to(device)
+            batch_x_static = batch_x_static.to(device)
             batch_y = batch_y.to(device)
 
-            # 前向传播：只取 logits
-            logits = model(batch_x)  # shape: [B, num_classes]
+            # 前向传播：获取 logits（忽略 features）
+            logits, _ = model(batch_x_seq, batch_x_static)  # [B, num_classes]
 
             # 预测类别
-            _, predicted = torch.max(logits, 1)  # 取最大概率的类别
+            _, predicted = torch.max(logits, 1)
 
             # 收集结果
             all_preds.extend(predicted.cpu().numpy())
@@ -423,17 +418,14 @@ def test_model(model, test_loader, record_report=False, writer=None):
 
     # 计算准确率
     accuracy = accuracy_score(all_labels, all_preds)
+
+    # 可选：记录详细的分类报告到 TensorBoard
     if record_report:
         report = classification_report(all_labels, all_preds, zero_division=0)
-        writer.add_text('test report',
-                        str(report),
-                        0
-                )
-
+        writer.add_text('Test Classification Report', str(report), 0)
+        print(f"Test Report:\n{report}")
 
     return accuracy
-
-
 
 
 
@@ -447,10 +439,10 @@ if __name__ == "__main__":
         '/home/dawn/Documents/HJ/data_all/U75VH/valid_N': (1, 'train'),
         '/home/dawn/Documents/HJ/data_all/U75VH/valid_P': (0, 'train'),
 
-        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/N': (1, 'train'),
-        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/P': (0, 'train'),
-        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_N': (1, 'train'),
-        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_P': (0, 'train'),
+        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/N': (1, 'train'),
+        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/P': (0, 'train'),
+        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_N': (1, 'train'),
+        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_P': (0, 'train'),
 
         '/home/dawn/Documents/HJ/data_all/processed test/1N': (1, 'validation'),
         '/home/dawn/Documents/HJ/data_all/processed test/1P': (0, 'validation'),
@@ -464,9 +456,12 @@ if __name__ == "__main__":
     }
 
     labeled_file_paths = get_labeled_file_paths(dataset_mapping)
-    data_train = []
-    data_test = []
-
+    data_train_seq = []
+    data_test_seq = []
+    data_train_static = []
+    data_test_static = []
+    shape_train_static = []
+    shape_test_static = []
 
     for path, label, dataset_type in labeled_file_paths:
         # 1. 特征提取
@@ -481,45 +476,95 @@ if __name__ == "__main__":
 
         # 删除包含NaN值的行
         df = df.dropna()
-        if dataset_type == 'train':
-            data_train.append([df, label])
-        else:
-            data_test.append([df, label])
+
+        # 1. 特征提取
+        features, _ = process_file_for_prediction(path)
+        if features is not None:
+            # # 获取特征的值
+            feature_values = features.values.flatten()
+            if dataset_type == 'train':
+                shape_train_static.append(feature_values.shape[0])
+                data_train_seq.append(
+                    [df, label])
+                data_train_static.append(feature_values)
+            else:
+                shape_test_static.append(feature_values.shape[0])
+                data_test_seq.append(
+                    [df, label])
+                data_test_static.append(feature_values)
 
 
-    tensors_train = global_standardize_and_convert_to_tensor(data_train)
+    # 找到 shapes 中频次最高的形状
+    shape_counts = Counter(shape_train_static + shape_test_static)
+    most_common_shape, _ = shape_counts.most_common(1)[0]  # 获取最高频次的形状
+
+    # 筛选出与最高频次形状一致的数据
+    filtered_data_train_seq = []
+    filtered_data_test_seq = []
+    filtered_data_train_static = []
+    filtered_data_test_static = []
+
+    for data_train_seq_, data_train_static_, shape_train_static_ in zip(data_train_seq, data_train_static, shape_train_static):
+        if shape_train_static_ == most_common_shape:
+            filtered_data_train_seq.append(data_train_seq_)
+            filtered_data_train_static.append(data_train_static_)
+
+    for data_test_seq_, data_test_static_, shape_test_static_ in zip(data_test_seq, data_test_static, shape_test_static):
+        if shape_test_static_ == most_common_shape:
+            filtered_data_test_seq.append(data_test_seq_)
+            filtered_data_test_static.append(data_test_static_)
+
+
+    # for seq data
+    tensors_train_seq = global_standardize_and_convert_to_tensor(data_train_seq)
     # 加载保存的 scaler
-    scaler_file = "scaler.pkl"
-    scaler = joblib.load(scaler_file)
-    print(f"Scaler 已从 {scaler_file} 加载")
-    tensors_test = global_standardize_and_convert_to_tensor(data_test, scaler=scaler)
+    scaler_file = "scaler_seq.pkl"
+    scaler_seq = joblib.load(scaler_file)
+    print(f"Scaler seq 已从 {scaler_file} 加载")
 
-    sequences_train, _ = zip(*tensors_train)
-    sequences_test, _ = zip(*tensors_test)
+    tensors_test_seq = global_standardize_and_convert_to_tensor(
+        data_test_seq, scaler=scaler_seq)
+    sequences_train, _ = zip(*tensors_train_seq)
+    sequences_test, _ = zip(*tensors_test_seq)
 
     # 找到最大序列长度
     # 如果有max_len，说明是测试集，则使用训练集的max_len
     max_len = max(seq.shape[1] for seq in sequences_train + sequences_test)
 
+    x_train_seq, y_train, max_len = prepare_welding_data(
+        tensors_train_seq, device='cuda:0', max_len=max_len)
+    print(f"批次数据形状: {x_train_seq.shape}")  # torch.Size([3, 4, 100])
+    x_test_seq, y_test, _ = prepare_welding_data(
+        tensors_test_seq, max_len, device='cuda:0')
+    print(f"批次数据形状: {x_test_seq.shape}")  # torch.Size([3, 4, 100])
+
+
+    # standard scaler
+    # 1. 创建并拟合标准化器（仅在训练集上 fit！）
+    scaler_static = StandardScaler()
+    filtered_data_train_static = scaler_static.fit_transform(
+        filtered_data_train_static)
+    # 2. 使用相同的 scaler 转换测试集（不能 fit！防止数据泄露）
+    filtered_data_test_static = scaler_static.transform(
+        filtered_data_test_static)
+
+    # for static data
+    x_train_static = torch.tensor(
+        filtered_data_train_static, dtype=torch.float32).to(device)
+    x_test_static = torch.tensor(
+        filtered_data_test_static, dtype=torch.float32).to(device)
+
     # 创建模型
-    model = FlashWeldingCNN_Simple(input_channels=4, num_classes=2).to(device)
-    # 准备数据
-    x_train, y_train, max_len = prepare_welding_data(
-        tensors_train, device='cuda:0', max_len=max_len)
-    print(f"批次数据形状: {x_train.shape}")  # torch.Size([3, 4, 100])
-    x_test, y_test, _ = prepare_welding_data(tensors_test, max_len, device='cuda:0')
-    print(f"批次数据形状: {x_test.shape}")  # torch.Size([3, 4, 100])
-
-
-
+    model = DualInputFlashWeldingModel(
+        input_channels=4, num_classes=2, static_dim=shape_train_static_).to(device)
     # 创建 Dataset 和 DataLoader
-    train_dataset = TensorDataset(x_train, y_train)
+    train_dataset = TensorDataset(x_train_seq, x_train_static, y_train)
     train_loader = DataLoader(
         train_dataset, batch_size=128, shuffle=True, drop_last=False,
         worker_init_fn=worker_init_fn
         )  # shuffle 每轮打乱
 
-    test_dataset = TensorDataset(x_test, y_test)
+    test_dataset = TensorDataset(x_test_seq, x_test_static, y_test)
     test_loader = DataLoader(
         test_dataset, batch_size=128, shuffle=False, drop_last=False,
         worker_init_fn=worker_init_fn
@@ -529,11 +574,11 @@ if __name__ == "__main__":
     num_epochs = 400
 
     # 初始化 SummaryWriter
-    log_dir = "runs/flash_welding_adapt_" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = "try_runs/flash_welding_adapt_" + datetime.now().strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard 日志已保存至: {log_dir}")
     writer.add_text('info',
-                    'CNN提取特征，使用对抗，使用AdaptiveAvgPool1d来解决维度不一样, used sampled data',
+                    'CNN提取特征+统计和物理特征，使用对抗，使用AdaptiveAvgPool1d来解决维度不一样',
                     0
                     )
     writer.add_text('data',
@@ -552,21 +597,21 @@ if __name__ == "__main__":
                     str(lambda_max),
                     0
                     )
-    writer.add_text('X_train_shape',
-                    str(x_train.shape),
+    writer.add_text('X_seq_shape',
+                    str(x_train_seq.shape),
                     0
                     )
-    writer.add_text('X_test_shape',
-                    str(x_test.shape),
+    writer.add_text('X_static_shape',
+                    str(x_train_static.shape),
                     0
                     )
 
-    # 添加模型结构到 TensorBoard
-    data_iter = iter(train_loader)
-    batch_x, _ = next(data_iter)
-    writer.add_graph(model, batch_x.to(device))
+    # # 添加模型结构到 TensorBoard
+    # data_iter = iter(train_loader)
+    # batch_x, _ = next(data_iter)
+    # writer.add_graph(model, batch_x.to(device))
 
-    train_model_adversarial(model, train_loader, test_loader, 
+    train_model_adversarial_dual(model, train_loader, test_loader,
                             num_epochs=num_epochs, learning_rate=1e-2,
                             lambda_max=lambda_max, writer=writer)
 
