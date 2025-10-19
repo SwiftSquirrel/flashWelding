@@ -181,20 +181,10 @@ def process_file_for_prediction(file_path):
 
             file_name = file_path.split('/')[-1].split('.')[0]
 
-            # # 画图展示
-            # calculate_explosion_freq_psd_with_plot(segment['TIME'].values, segment['CURRENT'].values)
-            
-
             # 提取特征
             cfg = tsfel.get_features_by_domain()
             cfg = refine_feature_cfg(cfg)
             features = tsfel.time_series_features_extractor(cfg, segment[['PRESSURE', 'CURRENT', 'DISPLACEMENT']], verbose=0)
-            # cfg = tsfel.get_features_by_domain('temporal')
-            # features = tsfel.time_series_features_extractor(
-            #     cfg, segment[['PRESSURE', 'CURRENT', 'DISPLACEMENT']], verbose=0)
-
-            # features.to_csv(f'features_{file_name}_with_data.csv')
-            # 为特征添加前缀以区分不同阶段的特征
             features.columns = [f"{stage_name}_{col}" for col in features.columns]
             all_features.append(features)
 
@@ -202,7 +192,6 @@ def process_file_for_prediction(file_path):
         all_features.append(add_features)
         # all_features = [add_features]
 
-        # if add_features:
 
         if all_features:
             # 合并所有阶段的特征
