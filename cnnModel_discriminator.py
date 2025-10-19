@@ -1,3 +1,5 @@
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,13 +13,13 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import TensorDataset, DataLoader
 import random
 import os
-
-
-import torch
-import torch.nn as nn
-import numpy as np
 import torch.autograd as autograd
+import math
 
+
+# 创建日志目录
+log_dir = "runs/flash_welding_adapt_" + datetime.now().strftime("%Y%m%d-%H%M%S")
+writer = SummaryWriter(log_dir)
 
 # 梯度反转层（Gradient Reverse Layer）
 class GradientReverseFunction(autograd.Function):
@@ -238,10 +240,14 @@ class FocalLoss(nn.Module):
 
 def train_model_adversarial(model, train_loader, test_loader,
                             num_epochs=10, learning_rate=0.001,
-                            lambda_adv=0.5):
+                            lambda_max=0.5, writer=None, use_linear_schedule=False):
     """
     使用对抗训练进行领域自适应
     """
+
+    global_step = 0
+    total_steps = num_epochs * len(train_loader)  # 总优化步数
+
     # 定义损失函数和优化器
     criterion_cls = FocalLoss(alpha=2, gamma=2)  # 分类损失
     domain_discriminator = DomainDiscriminator(feature_dim=64).to(device)
@@ -266,6 +272,16 @@ def train_model_adversarial(model, train_loader, test_loader,
         domain_preds, domain_labels = [], []
 
         for batch_x_src, batch_y_src in train_loader:
+
+            # ✅ 动态计算 lambda_adv
+            p = global_step / total_steps  # 当前训练进度 [0, 1]
+            if use_linear_schedule:
+                lambda_adv = lambda_max * p  # 线性增长
+            else:
+                # 可选：更平滑的调度（来自 DANN 论文）
+                lambda_adv = lambda_max * (2 / (1 + math.exp(-10 * p)) - 1)
+
+
             try:
                 batch_x_tgt, _ = next(test_iter)
             except StopIteration:
@@ -311,6 +327,7 @@ def train_model_adversarial(model, train_loader, test_loader,
             # 更简单写法：直接用 domain_labels_true，GRL 负梯度自动对抗
             # loss_adv = F.binary_cross_entropy_with_logits(domain_logits_adv.squeeze(), domain_labels_true)
 
+
             # 总损失
             loss = loss_cls + lambda_adv * loss_adv
 
@@ -318,6 +335,7 @@ def train_model_adversarial(model, train_loader, test_loader,
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
 
             # 记录
             _, predicted = torch.max(logits_src, 1)
@@ -328,6 +346,10 @@ def train_model_adversarial(model, train_loader, test_loader,
             dom_pred = (torch.sigmoid(domain_logits) > 0.5).float()
             domain_preds.extend(dom_pred.cpu().numpy())
             domain_labels.extend(domain_labels_true.cpu().numpy())
+
+            global_step += 1
+
+
 
         # 计算指标
         avg_cls_loss = total_cls_loss / len(train_loader)
@@ -345,9 +367,31 @@ def train_model_adversarial(model, train_loader, test_loader,
         test_acc = test_model(model, test_loader)
         print(f"Test Accuracy: {test_acc:.4f}")
 
+        # ✅ 记录当前 lambda_adv
+        current_lambda = lambda_max * (global_step / total_steps)
+        if not use_linear_schedule:
+            current_lambda = lambda_max * \
+                (2 / (1 + math.exp(-10 * (global_step / total_steps))) - 1)
+
+        # 记录到 TensorBoard
+        writer.add_scalar('Loss/Classification', avg_cls_loss, epoch)
+        writer.add_scalar('Loss/Domain', avg_domain_loss, epoch)
+        writer.add_scalar('Loss/Total', avg_cls_loss +
+                          lambda_adv * avg_domain_loss, epoch)
+        writer.add_scalar('Accuracy/Train', train_acc, epoch)
+        writer.add_scalar('Accuracy/Test', test_acc, epoch)
+        writer.add_scalar('Accuracy/Domain', domain_acc, epoch)
+        writer.add_scalar(
+            'Learning Rate', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar(
+            'current_lambda', current_lambda, epoch)
+
+    # 测试模型
+    test_model(model, test_loader, record_report=True, writer=writer)
 
 
-def test_model(model, test_loader):
+
+def test_model(model, test_loader, record_report=False, writer=None):
     """
     在测试集上评估模型准确率。
     
@@ -379,8 +423,12 @@ def test_model(model, test_loader):
 
     # 计算准确率
     accuracy = accuracy_score(all_labels, all_preds)
-    # print("\nClassification Report on Test Set:")
-    # print(classification_report(all_labels, all_preds, zero_division=0))
+    if record_report:
+        report = classification_report(all_labels, all_preds, zero_division=0)
+        writer.add_text('test report',
+                        str(report),
+                        0
+                )
 
 
     return accuracy
@@ -394,30 +442,25 @@ if __name__ == "__main__":
     device = 'cuda:0'
 
     dataset_mapping = {
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH/N': (1, 'train'),
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH/P': (0, 'train'),
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH/valid_N': (1, 'train'),
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH/valid_P': (0, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH/N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH/P': (0, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH/valid_N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH/valid_P': (0, 'train'),
 
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH_sampled/N': (1, 'train'),
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH_sampled/P': (0, 'train'),
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH_sampled/valid_N': (1, 'train'),
-        '/home/dawn/Documents/HJ/HJ/data_all/U75VH_sampled/valid_P': (0, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/P': (0, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_P': (0, 'train'),
 
+        '/home/dawn/Documents/HJ/data_all/processed test/1N': (1, 'validation'),
+        '/home/dawn/Documents/HJ/data_all/processed test/1P': (0, 'validation'),
+        '/home/dawn/Documents/HJ/data_all/924/1N': (1, 'validation'),
+        '/home/dawn/Documents/HJ/data_all/924/1P': (0, 'validation'),
 
-
-        '/home/dawn/Documents/HJ/HJ/data_all/processed test/1N': (1, 'validation'),
-        '/home/dawn/Documents/HJ/HJ/data_all/processed test/1P': (0, 'validation'),
-        '/home/dawn/Documents/HJ/HJ/data_all/924/1N': (1, 'validation'),
-        '/home/dawn/Documents/HJ/HJ/data_all/924/1P': (0, 'validation'),
-
-
-        '/home/dawn/Documents/HJ/HJ/data_all/processed test/2N': (1, 'validation'),
-        '/home/dawn/Documents/HJ/HJ/data_all/processed test/2P': (0, 'validation'),
-        '/home/dawn/Documents/HJ/HJ/data_all/924/2N': (1, 'validation'),
-        '/home/dawn/Documents/HJ/HJ/data_all/924/2P': (0, 'validation')
-
-
+        # '/home/dawn/Documents/HJ/data_all/processed test/2N': (1, 'validation'),
+        # '/home/dawn/Documents/HJ/data_all/processed test/2P': (0, 'validation'),
+        # '/home/dawn/Documents/HJ/data_all/924/2N': (1, 'validation'),
+        # '/home/dawn/Documents/HJ/data_all/924/2P': (0, 'validation')
     }
 
     labeled_file_paths = get_labeled_file_paths(dataset_mapping)
@@ -451,10 +494,6 @@ if __name__ == "__main__":
     print(f"Scaler 已从 {scaler_file} 加载")
     tensors_test = global_standardize_and_convert_to_tensor(data_test, scaler=scaler)
 
-    # # 打乱数据
-    # tensors_train = shuffle_data(tensors_train, seed=42)
-    # tensors_test = shuffle_data(tensors_test, seed=42)
-
     sequences_train, _ = zip(*tensors_train)
     sequences_test, _ = zip(*tensors_test)
 
@@ -486,15 +525,51 @@ if __name__ == "__main__":
         worker_init_fn=worker_init_fn
         )
 
+    lambda_max = 1
+    num_epochs = 400
 
-    # 调用训练函数
-    # train_model_adversarial(model, train_loader, test_loader, num_epochs=100,
-    #             learning_rate=0.001, lambda_mmd=1)
+    # 初始化 SummaryWriter
+    log_dir = "runs/flash_welding_adapt_" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    writer = SummaryWriter(log_dir)
+    print(f"TensorBoard 日志已保存至: {log_dir}")
+    writer.add_text('info',
+                    'CNN提取特征，使用对抗，使用AdaptiveAvgPool1d来解决维度不一样, used sampled data',
+                    0
+                    )
+    writer.add_text('data',
+                    str(dataset_mapping),
+                    0
+                    )
+    writer.add_text('data',
+                    str(dataset_mapping),
+                    0
+                    )
+    writer.add_text('num_epochs',
+                    str(num_epochs),
+                    0
+                    )
+    writer.add_text('lambda_max',
+                    str(lambda_max),
+                    0
+                    )
+    writer.add_text('X_train_shape',
+                    str(x_train.shape),
+                    0
+                    )
+    writer.add_text('X_test_shape',
+                    str(x_test.shape),
+                    0
+                    )
+
+    # 添加模型结构到 TensorBoard
+    data_iter = iter(train_loader)
+    batch_x, _ = next(data_iter)
+    writer.add_graph(model, batch_x.to(device))
 
     train_model_adversarial(model, train_loader, test_loader, 
-                            num_epochs=500, learning_rate=1e-3, 
-                            lambda_adv=0.5)
+                            num_epochs=num_epochs, learning_rate=1e-2,
+                            lambda_max=lambda_max, writer=writer)
 
-
-
-
+    # === 训练结束后关闭 writer ===
+    writer.close()
+    print(f"TensorBoard 日志已保存完毕。使用命令启动：\ntensorboard --logdir {log_dir}")
