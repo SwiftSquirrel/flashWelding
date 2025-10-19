@@ -79,75 +79,141 @@ def calculate_displacement_slope_and_detect_phases(time, displacement):
     return phases
 
 
+def refine_feature_cfg(cfg):
+    if 'spectral' in cfg:
+        # 只保留关键频域特征，去掉冗余的
+        spectral_keep = [
+            'Spectral entropy',
+            'Dominant frequency',
+            'Spectral roll-off',
+            'Power bandwidth',
+            'FFT coefficient'  # 可限制 coeffs 数量
+        ]
+        cfg['spectral'] = {
+            k: v for k, v in cfg['spectral'].items()
+            if k in spectral_keep
+        }
+        # 可进一步限制 FFT 系数数量（避免爆炸）
+        if 'FFT coefficient' in cfg['spectral']:
+            cfg['spectral']['FFT coefficient'] = {
+                'coeffs': [0, 1, 2, 3, 4]}  # 只取前5个
+
+    if 'temporal' in cfg:
+        # 只保留对焊接有意义的时域特征
+        temporal_keep = [
+            'Number of peaks',
+            'Zero crossings',
+            'Slope',
+            'Abs energy',
+            'Auto-correlation',
+            'Crest factor'
+        ]
+        cfg['temporal'] = {
+            k: v for k, v in cfg['temporal'].items()
+            if k in temporal_keep
+        }
+
+    if 'statistical' in cfg:
+        # 保留基础统计量
+        statistical_keep = [
+            'Mean', 'Standard deviation', 'Variance',
+            'Skewness', 'Kurtosis', 'Root mean square',
+            'Median', 'Interquartile range'
+        ]
+        cfg['statistical'] = {
+            k: v for k, v in cfg['statistical'].items()
+            if k in statistical_keep
+        }
+
+    if 'wavelet' in cfg:
+        # 小波特征对瞬态敏感，推荐保留
+        wavelet_keep = [
+            'Wavelet entropy',
+            'Sparsity',
+            'Wavelet packet spectrum'
+        ]
+        cfg['wavelet'] = {
+            k: v for k, v in cfg['wavelet'].items()
+            if k in wavelet_keep
+        }
+    return cfg
+
+
 def process_file_for_prediction(file_path):
     """为预测处理单个文件（与训练时的process_file函数一致，但不需要label）"""
-    # try:
-    df = pd.read_csv(file_path)
-    time = df.tail(1)['TIME'].values[0]
-    # 确保所有列都是数值类型
-    df['TIME'] = pd.to_numeric(df['TIME'], errors='coerce')
-    df['PRESSURE'] = pd.to_numeric(df['PRESSURE'], errors='coerce')
-    df['CURRENT'] = pd.to_numeric(df['CURRENT'], errors='coerce')
-    df['DISPLACEMENT'] = pd.to_numeric(df['DISPLACEMENT'], errors='coerce')
-    # print(file_path)
-    # 删除包含NaN值的行
-    df = df.dropna()
+    try:
+        df = pd.read_csv(file_path)
+        time = df.tail(1)['TIME'].values[0]
+        # 确保所有列都是数值类型
+        df['TIME'] = pd.to_numeric(df['TIME'], errors='coerce')
+        df['PRESSURE'] = pd.to_numeric(df['PRESSURE'], errors='coerce')
+        df['CURRENT'] = pd.to_numeric(df['CURRENT'], errors='coerce')
+        df['DISPLACEMENT'] = pd.to_numeric(df['DISPLACEMENT'], errors='coerce')
+        # print(file_path)
+        # 删除包含NaN值的行
+        df = df.dropna()
 
-    if df.empty:
-        return None
+        if df.empty:
+            return None
 
-    # 使用位移的斜率划分阶段
-    phases = calculate_displacement_slope_and_detect_phases(df['TIME'].values, df['DISPLACEMENT'].values)
+        # 使用位移的斜率划分阶段
+        phases = calculate_displacement_slope_and_detect_phases(df['TIME'].values, df['DISPLACEMENT'].values)
 
-    # 自动时间分割逻辑（结合阶段划分）
-    segments = {
-        'stage_1': df[(df['TIME'] <= phases['Phase 1'])] if phases['Phase 1'] else pd.DataFrame(),
-        'stage_2': df[(df['TIME'] > phases['Phase 1']) & (df['TIME'] <= phases['Phase 2'])] if phases['Phase 2'] else pd.DataFrame(),
-        'stage_3': df[(df['TIME'] > phases['Phase 2']) & (df['TIME'] <= phases['Phase 3'])] if phases['Phase 3'] else pd.DataFrame(),
-        'stage_4': df[(df['TIME'] > phases['Phase 3'])] if phases['Phase 3'] else pd.DataFrame()
-    }
-    for phase, phase_value in phases.items():
-        if not phase_value:
+        # 自动时间分割逻辑（结合阶段划分）
+        segments = {
+            'stage_1': df[(df['TIME'] <= phases['Phase 1'])] if phases['Phase 1'] else pd.DataFrame(),
+            'stage_2': df[(df['TIME'] > phases['Phase 1']) & (df['TIME'] <= phases['Phase 2'])] if phases['Phase 2'] else pd.DataFrame(),
+            'stage_3': df[(df['TIME'] > phases['Phase 2']) & (df['TIME'] <= phases['Phase 3'])] if phases['Phase 3'] else pd.DataFrame(),
+            'stage_4': df[(df['TIME'] > phases['Phase 3'])] if phases['Phase 3'] else pd.DataFrame()
+        }
+        for phase, phase_value in phases.items():
+            if not phase_value:
+                return None, None
+
+
+        all_features = []
+
+        add_features = feature_gene(segments)
+
+        for stage_name, segment in segments.items():
+            if segment.empty:
+                continue
+
+            file_name = file_path.split('/')[-1].split('.')[0]
+
+            # # 画图展示
+            # calculate_explosion_freq_psd_with_plot(segment['TIME'].values, segment['CURRENT'].values)
+            
+
+            # 提取特征
+            cfg = tsfel.get_features_by_domain()
+            cfg = refine_feature_cfg(cfg)
+            features = tsfel.time_series_features_extractor(cfg, segment[['PRESSURE', 'CURRENT', 'DISPLACEMENT']], verbose=0)
+            # cfg = tsfel.get_features_by_domain('temporal')
+            # features = tsfel.time_series_features_extractor(
+            #     cfg, segment[['PRESSURE', 'CURRENT', 'DISPLACEMENT']], verbose=0)
+
+            # features.to_csv(f'features_{file_name}_with_data.csv')
+            # 为特征添加前缀以区分不同阶段的特征
+            features.columns = [f"{stage_name}_{col}" for col in features.columns]
+            all_features.append(features)
+
+        add_features = convert_dict_to_dataframe(add_features)
+        all_features.append(add_features)
+        # all_features = [add_features]
+
+        # if add_features:
+
+        if all_features:
+            # 合并所有阶段的特征
+            combined_features = pd.concat(all_features, axis=1)
+            return combined_features, add_features
+        else:
             return None, None
 
-
-    all_features = []
-
-    add_features = feature_gene(segments)
-
-    for stage_name, segment in segments.items():
-        if segment.empty:
-            continue
-
-        file_name = file_path.split('/')[-1].split('.')[0]
-
-        # # 画图展示
-        # calculate_explosion_freq_psd_with_plot(segment['TIME'].values, segment['CURRENT'].values)
-        
-        # 提取特征
-        cfg = tsfel.get_features_by_domain()
-        features = tsfel.time_series_features_extractor(cfg, segment[['PRESSURE', 'CURRENT', 'DISPLACEMENT']], verbose=0)
-        # features.to_csv(f'features_{file_name}_with_data.csv')
-        # 为特征添加前缀以区分不同阶段的特征
-        features.columns = [f"{stage_name}_{col}" for col in features.columns]
-        all_features.append(features)
-
-    add_features = convert_dict_to_dataframe(add_features)
-    all_features.append(add_features)
-    # all_features = [add_features]
-
-    # if add_features:
-
-    if all_features:
-        # 合并所有阶段的特征
-        combined_features = pd.concat(all_features, axis=1)
-        return combined_features, add_features
-    else:
+    except Exception as e:
+        print(f"处理文件 {file_path} 时出错: {e}")
         return None, None
-
-    # except Exception as e:
-    #     print(f"处理文件 {file_path} 时出错: {e}")
-    #     return None, None
 
 
 
