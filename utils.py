@@ -6,9 +6,51 @@ from scipy.integrate import simpson
 from scipy.signal import savgol_filter, argrelextrema
 from scipy import signal
 from typing import Tuple, Optional
-
+from scipy.interpolate import interp1d
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def time_series_to_image(ts_data, target_length=5000):
+    """
+    将变长时间序列转换为固定长度 5000 x 3 的“图像”表示
+    
+    Args:
+        ts_data: numpy array of shape (N, 4), columns = [time, pressure, displacement, current]
+        target_length: int, 输出长度，默认 5000
+    
+    Returns:
+        image: numpy array of shape (target_length, 3), 对应 [pressure, displacement, current]
+    """
+    # 提取各列
+    t = ts_data[:, 0]  # 时间
+    p = ts_data[:, 1]  # 压力
+    d = ts_data[:, 2]  # 位移
+    c = ts_data[:, 3]  # 电流
+
+    # 归一化时间轴到 [0, 1] 区间（避免数值过大导致插值问题）
+    t_normalized = (t - t.min()) / (t.max() - t.min() + 1e-8)
+
+    # 目标时间点：均匀分布在 [0, 1] 上的 5000 个点
+    t_new = np.linspace(0, 1, target_length)
+
+    # 插值函数（线性插值即可，也可用更高阶）
+    interp_func_p = interp1d(
+        t_normalized, p, kind='linear', bounds_error=False, fill_value='extrapolate')
+    interp_func_d = interp1d(
+        t_normalized, d, kind='linear', bounds_error=False, fill_value='extrapolate')
+    interp_func_c = interp1d(
+        t_normalized, c, kind='linear', bounds_error=False, fill_value='extrapolate')
+
+    # 插值得到新序列
+    p_new = interp_func_p(t_new)
+    d_new = interp_func_d(t_new)
+    c_new = interp_func_c(t_new)
+
+    # 合并为 (5000, 3)
+    image = np.stack([p_new, d_new, c_new], axis=1)  # shape: (5000, 3)
+
+    return image
 
 
 def convert_dict_to_dataframe(add_feature_dict):

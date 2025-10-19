@@ -3,7 +3,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import get_labeled_file_paths, shuffle_data, process_file_for_prediction
+from utils import get_labeled_file_paths, shuffle_data, process_file_for_prediction, time_series_to_image
 import numpy as np
 import pandas as pd
 import joblib
@@ -439,10 +439,10 @@ if __name__ == "__main__":
         '/home/dawn/Documents/HJ/data_all/U75VH/valid_N': (1, 'train'),
         '/home/dawn/Documents/HJ/data_all/U75VH/valid_P': (0, 'train'),
 
-        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/N': (1, 'train'),
-        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/P': (0, 'train'),
-        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_N': (1, 'train'),
-        # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_P': (0, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/P': (0, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH_sampled/valid_P': (0, 'train'),
 
         '/home/dawn/Documents/HJ/data_all/processed test/1N': (1, 'validation'),
         '/home/dawn/Documents/HJ/data_all/processed test/1P': (0, 'validation'),
@@ -462,6 +462,9 @@ if __name__ == "__main__":
     data_test_static = []
     shape_train_static = []
     shape_test_static = []
+    data_train_y = []
+    data_test_y = []
+
 
     for path, label, dataset_type in labeled_file_paths:
         # 1. 特征提取
@@ -485,14 +488,15 @@ if __name__ == "__main__":
             if dataset_type == 'train':
                 shape_train_static.append(feature_values.shape[0])
                 data_train_seq.append(
-                    [df, label])
+                    time_series_to_image(df.values))
                 data_train_static.append(feature_values)
+                data_train_y.append(label)
             else:
                 shape_test_static.append(feature_values.shape[0])
                 data_test_seq.append(
-                    [df, label])
+                    time_series_to_image(df.values))
                 data_test_static.append(feature_values)
-
+                data_test_y.append(label)
 
     # 找到 shapes 中频次最高的形状
     shape_counts = Counter(shape_train_static + shape_test_static)
@@ -503,39 +507,44 @@ if __name__ == "__main__":
     filtered_data_test_seq = []
     filtered_data_train_static = []
     filtered_data_test_static = []
+    filtered_data_train_y = []
+    filtered_data_test_y = []
 
-    for data_train_seq_, data_train_static_, shape_train_static_ in zip(data_train_seq, data_train_static, shape_train_static):
+    for data_train_seq_, data_train_static_, shape_train_static_, filtered_data_train_y_ in zip(data_train_seq, data_train_static, shape_train_static, data_train_y):
         if shape_train_static_ == most_common_shape:
             filtered_data_train_seq.append(data_train_seq_)
             filtered_data_train_static.append(data_train_static_)
+            filtered_data_train_y.append(filtered_data_train_y_)
 
-    for data_test_seq_, data_test_static_, shape_test_static_ in zip(data_test_seq, data_test_static, shape_test_static):
+    for data_test_seq_, data_test_static_, shape_test_static_, filtered_data_test_y_ in zip(data_test_seq, data_test_static, shape_test_static, data_test_y):
         if shape_test_static_ == most_common_shape:
             filtered_data_test_seq.append(data_test_seq_)
             filtered_data_test_static.append(data_test_static_)
+            filtered_data_test_y.append(filtered_data_test_y_)
 
+
+    scaler_seq = StandardScaler()
+    filtered_data_train_seq = scaler_seq.fit_transform(
+        np.concatenate(filtered_data_train_seq, axis=0))
+    # 2. 使用相同的 scaler 转换测试集（不能 fit！防止数据泄露）
+    filtered_data_test_seq = scaler_seq.transform(
+        np.concatenate(filtered_data_test_seq, axis=0))
+    filtered_data_train_seq = filtered_data_train_seq.reshape(-1, 5000, 3)
+    filtered_data_test_seq = filtered_data_test_seq.reshape(-1, 5000, 3)
+    filtered_data_train_seq = filtered_data_train_seq.reshape(-1, 3, 5000)
+    filtered_data_test_seq = filtered_data_test_seq.reshape(-1, 3, 5000)
 
     # for seq data
-    tensors_train_seq = global_standardize_and_convert_to_tensor(data_train_seq)
-    # 加载保存的 scaler
-    scaler_file = "scaler_seq.pkl"
-    scaler_seq = joblib.load(scaler_file)
-    print(f"Scaler seq 已从 {scaler_file} 加载")
+    x_train_seq = torch.tensor(
+        filtered_data_train_seq, dtype=torch.float32).to(device)
+    x_test_seq = torch.tensor(
+        filtered_data_test_seq, dtype=torch.float32).to(device)
 
-    tensors_test_seq = global_standardize_and_convert_to_tensor(
-        data_test_seq, scaler=scaler_seq)
-    sequences_train, _ = zip(*tensors_train_seq)
-    sequences_test, _ = zip(*tensors_test_seq)
 
-    # 找到最大序列长度
-    # 如果有max_len，说明是测试集，则使用训练集的max_len
-    max_len = max(seq.shape[1] for seq in sequences_train + sequences_test)
+    y_train = torch.tensor(filtered_data_train_y).to(device)
+    y_test = torch.tensor(filtered_data_test_y).to(device)
 
-    x_train_seq, y_train, max_len = prepare_welding_data(
-        tensors_train_seq, device='cuda:0', max_len=max_len)
     print(f"批次数据形状: {x_train_seq.shape}")  # torch.Size([3, 4, 100])
-    x_test_seq, y_test, _ = prepare_welding_data(
-        tensors_test_seq, max_len, device='cuda:0')
     print(f"批次数据形状: {x_test_seq.shape}")  # torch.Size([3, 4, 100])
 
 
@@ -556,7 +565,7 @@ if __name__ == "__main__":
 
     # 创建模型
     model = DualInputFlashWeldingModel(
-        input_channels=4, num_classes=2, static_dim=shape_train_static_).to(device)
+        input_channels=3, num_classes=2, static_dim=shape_train_static_).to(device)
     # 创建 Dataset 和 DataLoader
     train_dataset = TensorDataset(x_train_seq, x_train_static, y_train)
     train_loader = DataLoader(
@@ -574,11 +583,11 @@ if __name__ == "__main__":
     num_epochs = 400
 
     # 初始化 SummaryWriter
-    log_dir = "try_runs/flash_welding_adapt_" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = "runs/flash_welding_adapt_" + datetime.now().strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard 日志已保存至: {log_dir}")
     writer.add_text('info',
-                    'CNN提取特征+统计和物理特征，使用对抗，使用AdaptiveAvgPool1d来解决维度不一样',
+                    '数据转化成（5000，3）+CNN提取特征+统计和物理特征，使用对抗，使用AdaptiveAvgPool1d来解决维度不一样, used sampled data',
                     0
                     )
     writer.add_text('data',
