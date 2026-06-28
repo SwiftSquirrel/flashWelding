@@ -185,6 +185,10 @@ def process_file_for_prediction(file_path):
     """为预测处理单个文件（与训练时的process_file函数一致，但不需要label）"""
     try:
         df = pd.read_csv(file_path)
+        if 'HJ/data_all/202606' in file_path:
+            df = df.rename(
+                columns={'时间(s)': 'TIME', '压力': 'PRESSURE', '电流': 'CURRENT', '位移(mm)': 'DISPLACEMENT'})
+
         time = df.tail(1)['TIME'].values[0]
         # 确保所有列都是数值类型
         df['TIME'] = pd.to_numeric(df['TIME'], errors='coerce')

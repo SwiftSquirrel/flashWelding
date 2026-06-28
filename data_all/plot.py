@@ -5,8 +5,8 @@ import numpy as np
 
 
 # 文件夹路径
-input_folder = "data_all/test2/P"  # 数据文件夹
-output_folder = "data_all/test2/P_plot"  # 保存图像的文件夹
+input_folder = "/home/dawn/Documents/HJ/data_all/202606_Plot/good"  # 数据文件夹
+output_folder = "/home/dawn/Documents/HJ/data_all/202606_Plot/good_Plot"  # 保存图像的文件夹
 
 # 创建输出文件夹（如果不存在）
 os.makedirs(output_folder, exist_ok=True)
@@ -61,12 +61,12 @@ def func(df):
     return phases
 
 
-# i = 0
+i = 0
 # 遍历文件夹中的所有文件
 for file_name in os.listdir(input_folder):
-    # if i >0:
-    #     continue
-    # i += 1
+    if i > 10:
+        continue
+    i += 1
     file_path = os.path.join(input_folder, file_name)
     
     # 检查是否为文件（可以根据需要调整文件类型，如 .csv）
@@ -79,7 +79,10 @@ for file_name in os.listdir(input_folder):
             if data.shape[1] < 4:
                 print(f"文件 {file_name} 列数不足，跳过...")
                 continue
-
+            
+            if 'HJ/data_all/202606' in file_path:
+                data = data.rename(
+                    columns={'时间(s)': 'TIME', '压力': 'PRESSURE', '电流': 'CURRENT', '位移(mm)': 'DISPLACEMENT'})
             phases = calculate_displacement_slope_and_detect_phases(data['TIME'].values, data['DISPLACEMENT'].values)
 
             # 提取列名
