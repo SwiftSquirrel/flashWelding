@@ -259,12 +259,14 @@ def process_file_for_prediction(file_path):
 
         time = df.tail(1)['TIME'].values[0]
         # 确保所有列都是数值类型
-        df['TIME'] = pd.to_numeric(df['TIME'], errors='coerce')
-        df['PRESSURE'] = pd.to_numeric(df['PRESSURE'], errors='coerce')
-        df['CURRENT'] = pd.to_numeric(df['CURRENT'], errors='coerce')
-        df['DISPLACEMENT'] = pd.to_numeric(df['DISPLACEMENT'], errors='coerce')
+        df['TIME'] = pd.to_numeric(df['TIME'], errors='coerce').round(1)
+        df['PRESSURE'] = pd.to_numeric(df['PRESSURE'], errors='coerce').round(1)
+        df['CURRENT'] = pd.to_numeric(df['CURRENT'], errors='coerce').round(1)
+        df['DISPLACEMENT'] = pd.to_numeric(
+            df['DISPLACEMENT'], errors='coerce').round(1)
         # print(file_path)
         # 删除包含NaN值的行
+
         df = df.dropna()
 
         if df.empty:
