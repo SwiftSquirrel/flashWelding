@@ -8,8 +8,8 @@ from scipy.stats import linregress
 
 
 # 文件夹路径
-# input_folder = "/Users/dawn/PYY/flashWelding/data_all/202606/good"  # 数据文件夹
-# output_folder = "/Users/dawn/PYY/flashWelding/data_all/202606/202606_good_Plot"  # 保存图像的文件夹
+# input_folder = "/Users/dawn/PYY/flashWelding/202606/good"  # 数据文件夹
+# output_folder = "/Users/dawn/PYY/flashWelding/202606/202606_good_Plot"  # 保存图像的文件夹
 input_folder = "/Users/dawn/PYY/flashWelding/U75VH/P"  # 数据文件夹
 output_folder = "/Users/dawn/PYY/flashWelding/U75VH/P_Plot"  # 保存图像的文件夹
 # 创建输出文件夹（如果不存在）
@@ -23,24 +23,28 @@ def calculate_displacement_slope_and_detect_phases(time, displacement):
     def calculate_slope_with_window(time, displacement, window_size):
         slopes = np.zeros_like(time)
         half_window = window_size // 2
+
         for i in range(len(time)):
             start = max(0, i - half_window)
             end = min(len(time), i + half_window + 1)
+
             if end - start > 1:
-                slope, _, _, _, _ = linregress(time[start:end], displacement[start:end])
-                slopes[i] = slope
+                # 使用中心差分法计算斜率
+                delta_time = time[end - 1] - time[start]
+                delta_displacement = displacement[end - 1] - displacement[start]
+                slopes[i] = delta_displacement / delta_time if delta_time != 0 else 0
             else:
                 slopes[i] = 0
+
         return slopes
 
-    # 对 time 进行线性化
-    linearized_time = np.linspace(time[0], time[-1], len(time))
-    time = linearized_time  # 替代原始 time
+    # # 对 time 进行线性化
+    # linearized_time = np.linspace(time[0], time[-1], len(time))
+    # time = linearized_time  # 替代原始 time
 
     window_size = 11  # 滑动窗口大小
     slope = calculate_slope_with_window(time, displacement, window_size)
     abs_slope = np.abs(slope)
-
 
 
     phases = {}
@@ -51,7 +55,7 @@ def calculate_displacement_slope_and_detect_phases(time, displacement):
     phases['Phase 1'] = time[point1_index] if slope[point1_index] > 3 else None
 
     # 规则 2: 在100s之前，最后一个斜率绝对值超过3的点
-    range_before_100 = time < 90
+    range_before_100 = time < 92.5
     valid_indices_before_100 = np.where((abs_slope > 3) & range_before_100)[0]
     point2_index = valid_indices_before_100[-1] if len(valid_indices_before_100) > 0 else None
     phases['Phase 2'] = time[point2_index] if point2_index is not None else None
@@ -202,7 +206,7 @@ for file_name in os.listdir(input_folder):
                 print(f"文件 {file_name} 列数不足，跳过...")
                 continue
             
-            if 'data_all/202606' in file_path:
+            if ('202606/good' in file_path) or ('202606/bad' in file_path):
                 data = data.rename(
                     columns={'时间(s)': 'TIME', '压力': 'PRESSURE', '电流': 'CURRENT', '位移(mm)': 'DISPLACEMENT'})
             phases = calculate_displacement_slope_and_detect_phases(data['TIME'].values, data['DISPLACEMENT'].values)

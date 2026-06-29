@@ -162,7 +162,7 @@ def calculate_displacement_slope_and_detect_phases(time, displacement):
     phases['Phase 1'] = time[point1_index] if slope[point1_index] > 3 else None
 
     # 规则 2: 在100s之前，最后一个斜率绝对值超过3的点
-    range_before_100 = time < 90
+    range_before_100 = time < 92.5
     valid_indices_before_100 = np.where((abs_slope > 3) & range_before_100)[0]
     point2_index = valid_indices_before_100[-1] if len(valid_indices_before_100) > 0 else None
     phases['Phase 2'] = time[point2_index] if point2_index is not None else None
@@ -253,7 +253,7 @@ def process_file_for_prediction(file_path):
     """为预测处理单个文件（与训练时的process_file函数一致，但不需要label）"""
     try:
         df = pd.read_csv(file_path)
-        if '202606/bad' or '202606/good' in file_path:
+        if ('202606/bad' in file_path) or ('202606/good' in file_path):
             df = df.rename(
                 columns={'时间(s)': 'TIME', '压力': 'PRESSURE', '电流': 'CURRENT', '位移(mm)': 'DISPLACEMENT'})
 
