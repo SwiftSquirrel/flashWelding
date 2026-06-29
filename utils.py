@@ -130,14 +130,19 @@ def calculate_displacement_slope_and_detect_phases(time, displacement):
     def calculate_slope_with_window(time, displacement, window_size):
         slopes = np.zeros_like(time)
         half_window = window_size // 2
+
         for i in range(len(time)):
             start = max(0, i - half_window)
             end = min(len(time), i + half_window + 1)
+
             if end - start > 1:
-                slope, _, _, _, _ = linregress(time[start:end], displacement[start:end])
-                slopes[i] = slope
+                # 使用中心差分法计算斜率
+                delta_time = time[end - 1] - time[start]
+                delta_displacement = displacement[end - 1] - displacement[start]
+                slopes[i] = delta_displacement / delta_time if delta_time != 0 else 0
             else:
                 slopes[i] = 0
+
         return slopes
 
     # # 对 time 进行线性化
