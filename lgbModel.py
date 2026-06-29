@@ -125,9 +125,9 @@ if __name__=='__main__':
     # note negative means the sample is bad, we use 1 to represent bad
     dataset_mapping = {
 
-        '/Users/dawn/PYY/flashWelding/U75VH/N': (1, 'train'),
-        '/Users/dawn/PYY/flashWelding/U75VH/P': (0, 'train'),
-        '/Users/dawn/PYY/flashWelding/U75VH/valid_N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH/N': (1, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH//P': (0, 'train'),
+        '/home/dawn/Documents/HJ/data_all/U75VH/valid_N': (1, 'train'),
         '/home/dawn/Documents/HJ/data_all/U75VH/valid_P': (0, 'train'),
 
         # '/home/dawn/Documents/HJ/data_all/U75VH_sampled/N': (1, 'train'),
@@ -142,8 +142,8 @@ if __name__=='__main__':
         # '/home/dawn/Documents/HJ/data_all/924/1P': (0, 'validation'),
 
 
-        '/Users/dawn/PYY/flashWelding/202606/bad': (1, 'validation'),
-        '/Users/dawn/PYY/flashWelding/202606/good': (0, 'validation')
+        '/home/dawn/Documents/HJ/data_all/202606/bad': (1, 'validation'),
+        '/home/dawn/Documents/HJ/data_all/202606/good': (0, 'validation')
 
 
         # '/home/dawn/Documents/HJ/data_all/processed test/2N': (1, 'validation'),
@@ -157,6 +157,8 @@ if __name__=='__main__':
         # base_dir=base_dir,
         dataset_mapping=dataset_mapping)
 
+
+    print('============finished dataset preparation===========')
     # X_train, X_test, y_train, y_test = train_test_split(
     #     X_train, y_train,
     #     test_size=0.3,      # 测试集占 20%
