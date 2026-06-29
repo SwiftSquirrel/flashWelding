@@ -281,17 +281,17 @@ def process_file_for_prediction(file_path):
         phases = calculate_displacement_slope_and_detect_phases(df['TIME'].values, df['DISPLACEMENT'].values)
 
 
-        # 对 PRESSURE, CURRENT, DISPLACEMENT 列进行 0-1 标准化
+        # 对 PRESSURE, CURRENT, DISPLACEMENT 列进行 Z-Score 标准化
         columns_to_normalize = ['PRESSURE', 'CURRENT', 'DISPLACEMENT']
 
         for col in columns_to_normalize:
             if col in df.columns:
-                min_val = df[col].min()
-                max_val = df[col].max()
-                if max_val - min_val > 0:  # 避免除以 0
-                    df[col] = (df[col] - min_val) / (max_val - min_val)
+                mean_val = df[col].mean()
+                std_val = df[col].std()
+                if std_val > 0:  # 避免除以 0
+                    df[col] = (df[col] - mean_val) / std_val
                 else:
-                    df[col] = 0  # 如果所有值相同，直接设置为 0
+                    df[col] = 0  # 如果标准差为 0，直接设置为 0
 
 
         # 自动时间分割逻辑（结合阶段划分）
