@@ -9,6 +9,8 @@ from typing import Tuple, Optional
 from scipy.interpolate import interp1d
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+from scipy.interpolate import interp1d
+from scipy.stats import linregress
 
 
 def time_series_to_image(ts_data, target_length=5000):
@@ -93,11 +95,59 @@ def get_labeled_file_paths(dataset_mapping):
     return labeled_paths
 
 
-# ==================== 特征提取函数（与训练时完全一致）====================
+# # ==================== 特征提取函数（与训练时完全一致）====================
+# def calculate_displacement_slope_and_detect_phases(time, displacement):
+#     """计算位移斜率并按规则划分阶段."""
+#     slope = np.gradient(displacement, time)
+#     abs_slope = np.abs(slope)
+
+#     phases = {}
+
+#     # 规则 1: 在10-30s内，第一个斜率数值超过3的点
+#     range_10_30 = (time >= 10) & (time <= 30)
+#     point1_index = np.argmax((slope > 3) & range_10_30)
+#     phases['Phase 1'] = time[point1_index] if slope[point1_index] > 3 else None
+
+#     # 规则 2: 在100s之前，最后一个斜率绝对值超过5的点
+#     range_before_100 = time < 100
+#     valid_indices_before_100 = np.where((abs_slope > 5) & range_before_100)[0]
+#     point2_index = valid_indices_before_100[-1] if len(valid_indices_before_100) > 0 else None
+#     phases['Phase 2'] = time[point2_index] if point2_index is not None else None
+
+#     # 规则 3: 在100s之后，第一个斜率绝对值超过40的点
+#     range_after_100 = time > 100
+#     valid_indices_after_100 = np.where((abs_slope > 40) & range_after_100)[0]
+#     point3_index = valid_indices_after_100[0] if len(valid_indices_after_100) > 0 else None
+#     phases['Phase 3'] = time[point3_index] if point3_index is not None else None
+
+#     return phases
+
+
+
 def calculate_displacement_slope_and_detect_phases(time, displacement):
-    """计算位移斜率并按规则划分阶段."""
-    slope = np.gradient(displacement, time)
+    """直接在原始数据上计算位移斜率并按规则划分阶段."""
+    # 使用滑动窗口计算斜率
+    def calculate_slope_with_window(time, displacement, window_size):
+        slopes = np.zeros_like(time)
+        half_window = window_size // 2
+        for i in range(len(time)):
+            start = max(0, i - half_window)
+            end = min(len(time), i + half_window + 1)
+            if end - start > 1:
+                slope, _, _, _, _ = linregress(time[start:end], displacement[start:end])
+                slopes[i] = slope
+            else:
+                slopes[i] = 0
+        return slopes
+
+    # # 对 time 进行线性化
+    # linearized_time = np.linspace(time[0], time[-1], len(time))
+    # time = linearized_time  # 替代原始 time
+
+    window_size = 11  # 滑动窗口大小
+    slope = calculate_slope_with_window(time, displacement, window_size)
     abs_slope = np.abs(slope)
+
 
     phases = {}
 
@@ -106,19 +156,32 @@ def calculate_displacement_slope_and_detect_phases(time, displacement):
     point1_index = np.argmax((slope > 3) & range_10_30)
     phases['Phase 1'] = time[point1_index] if slope[point1_index] > 3 else None
 
-    # 规则 2: 在100s之前，最后一个斜率绝对值超过5的点
-    range_before_100 = time < 100
-    valid_indices_before_100 = np.where((abs_slope > 5) & range_before_100)[0]
+    # 规则 2: 在100s之前，最后一个斜率绝对值超过3的点
+    range_before_100 = time < 90
+    valid_indices_before_100 = np.where((abs_slope > 3) & range_before_100)[0]
     point2_index = valid_indices_before_100[-1] if len(valid_indices_before_100) > 0 else None
     phases['Phase 2'] = time[point2_index] if point2_index is not None else None
 
-    # 规则 3: 在100s之后，第一个斜率绝对值超过40的点
-    range_after_100 = time > 100
-    valid_indices_after_100 = np.where((abs_slope > 40) & range_after_100)[0]
-    point3_index = valid_indices_after_100[0] if len(valid_indices_after_100) > 0 else None
-    phases['Phase 3'] = time[point3_index] if point3_index is not None else None
+    # 规则 3: 在90s之后，找到梯度最大的点
+    range_after_90 = time > 90
+    valid_indices_after_90 = np.where(range_after_90)[0]
+
+    if len(valid_indices_after_90) > 0:
+        max_slope_index = valid_indices_after_90[np.argmax(abs_slope[valid_indices_after_90])]
+        phases['Phase 3'] = time[max_slope_index]
+    else:
+        phases['Phase 3'] = None
+
+
+    # 检查 Phase 3 和 Phase 2 的时间差
+    if phases['Phase 2'] is not None and phases['Phase 3'] is not None:
+        if abs(phases['Phase 3'] - phases['Phase 2']) < 5:
+            # 如果时间差小于 5，删除 Phase 2
+            phases['Phase 2'] = None
+
 
     return phases
+
 
 
 def refine_feature_cfg(cfg):
@@ -185,7 +248,7 @@ def process_file_for_prediction(file_path):
     """为预测处理单个文件（与训练时的process_file函数一致，但不需要label）"""
     try:
         df = pd.read_csv(file_path)
-        if 'HJ/data_all/202606' in file_path:
+        if '202606/bad' or '202606/good' in file_path:
             df = df.rename(
                 columns={'时间(s)': 'TIME', '压力': 'PRESSURE', '电流': 'CURRENT', '位移(mm)': 'DISPLACEMENT'})
 
@@ -202,8 +265,15 @@ def process_file_for_prediction(file_path):
         if df.empty:
             return None
 
+        time = df['TIME'].values
+        # 对 time 进行线性化
+        linearized_time = np.linspace(time[0], time[-1], len(time))
+        df['TIME'] = linearized_time  # 替代原始 time
+
         # 使用位移的斜率划分阶段
         phases = calculate_displacement_slope_and_detect_phases(df['TIME'].values, df['DISPLACEMENT'].values)
+
+
 
         # 自动时间分割逻辑（结合阶段划分）
         segments = {
